@@ -1,6 +1,3 @@
-fastapi
-uvicorn
-httpx
-gtfs-realtime-bindings==3.0.0
-apscheduler
-asyncpg
+requests>=2.32
+psycopg[binary]>=3.2
+gtfs-realtime-bindings>=1.0

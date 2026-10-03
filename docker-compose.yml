@@ -1,0 +1,25 @@
+services:
+  db:
+    build: ./db
+    environment:
+      POSTGRES_USER: bus
+      POSTGRES_PASSWORD: bus          # fine while bound to localhost only (see ports)
+      POSTGRES_DB: bus
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    ports: ["127.0.0.1:5432:5432"]
+    restart: unless-stopped
+
+  collector:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://bus:bus@db:5432/bus}
+      DATA_DIR: /data
+    volumes: ["./data:/data"]
+    depends_on: [db]
+    restart: unless-stopped
+
+volumes:
+  pgdata:
