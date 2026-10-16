@@ -2,7 +2,7 @@
 
 Predicts the chance that a Dublin bus or tram gets you somewhere **on time**, and picks the route most likely to arrive before your deadline rather than just the fastest one on paper. It is built on a live pipeline that has collected the National Transport Authority (NTA) realtime feeds every minute since 3 October 2026, and turns raw GPS into actual stop arrival times every night.
 
-> **Status:** collection and nightly arrival labels are live (Dublin Bus, Go-Ahead Ireland, LUAS). Baseline model, gradient boosting, routing and the agent are next. See [Roadmap](#roadmap).
+> **Status:** collection and nightly arrival labels are live (Dublin Bus, Go-Ahead Ireland, LUAS). The baseline model is done (see [What the data looks like](#what-the-data-looks-like)); gradient boosting, routing and the agent are next. See [Roadmap](#roadmap).
 >
 > For a file-by-file explanation of how the code works, read **[docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md)**.
 
@@ -67,6 +67,15 @@ nightly.sh (cron, 07:00 UTC)
 |---|---|
 | Raw archive on VM disk | ~170 MB/day, ~11 months on the free disk |
 | Database growth (excluding timetable) | ~70 MB/day |
+
+| Baseline, `model/baseline.py` (train 4-12 Oct, test 13-15 Oct, target: more than 5 min late) | Brier | Skill | Log loss | AUC |
+|---|---|---|---|---|
+| Overall late rate (22-24%) | 0.174 | 0% | 0.532 | 0.50 |
+| + route, day type | 0.171 | 1.6% | 0.524 | 0.59 |
+| + direction, hour | 0.164 | 5.9% | 0.502 | 0.68 |
+| + stop | **0.157** | **9.5%** | **0.485** | **0.72** |
+
+Brier is the mean squared error of the predicted probability (lower is better), skill is the Brier improvement over always predicting the overall rate, and AUC is the chance a late arrival gets a higher score than an on-time one (0.5 = guessing). History alone explains about a tenth of the uncertainty. Calibration is good up to about 30% but too high above it (predicted 57% late, actual 49% in the 0.5-0.7 bin): the test days were less late than the training days (22.4% vs 23.9%), and nine days of history overfit the busiest stop-hours. This is the number gradient boosting must beat.
 
 ## Repository layout
 
@@ -145,7 +154,7 @@ Rate limits: polling both feeds once a minute is about 2,900 requests a day. Run
 - [x] Realtime collection with raw archive, monitoring
 - [x] Versioned timetable, loaded only when it really changes
 - [x] Arrival-time labels: stop placement and GPS tracking along route shapes, nightly job
-- [ ] Baseline: historical delay distribution by route, stop, hour and day type (from ~17 October)
+- [x] Baseline: historical late rate by route, direction, stop, hour and day type, shrunk towards coarser groups (Brier skill 9.5%, AUC 0.72)
 - [ ] Gradient boosting with weather, school holidays and previous-trip-in-block delay; delay quantiles, not just a threshold; benchmark against NTA's own predictions
 - [ ] Storage lifecycle: compact old raw data, move old GPS rows out of the database
 - [ ] Deadline routing: the itinerary with the highest probability of arriving on time (OpenTripPlanner or r5py for candidates)

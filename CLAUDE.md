@@ -31,13 +31,10 @@ Portfolio project: predict the probability that a Dublin bus or LUAS arrives lat
 
 ## Current state (16 October 2026)
 - Labels exist from 4 October, about 470k arrivals per weekday, 92-93% of scheduled stops, median delay about +2 min, about 25% more than 5 min late.
-- Many changes are **not yet committed**: check `git status` and commit with Yash's agreement.
-- `model/baseline.py` (+ `model/test_baseline.py`, passing) is written but not yet run on real data.
+- Work through 16 Oct is committed on branch `nightly-labels` (not merged or pushed).
+- Baseline run 16 Oct on labels 4-15 Oct (test 13-15 Oct): Brier 0.157, skill 9.5% over the overall rate, AUC 0.72, overconfident above ~30% predicted. Results in the README. Python for the model: `.venv` on the Mac (`pip install -r model/requirements.txt`).
 
 ## Open items, in order
 1. **Database growth.** Storage went from about 25% to 35% of 32 GiB in 6 days (about 0.5 GB/day, ~40 days left). Measured 16 Oct: about 4 GB of "Storage used" is fixed Azure overhead; observation tables grow about 0.23 GB/day; the rest was a bug (pruned timetable zips were reloaded every night, leaving about 1.5 GB of reusable free space in `stop_times`), fixed and deployed 16 Oct. Re-check growth after a few nights. Likely next fix, to agree with Yash: nightly delete `vehicle_obs` rows older than ~7 days once their labels exist (the raw archive keeps every GPS fix, so they can be rebuilt). `stop_obs` keeps only NTA's last prediction (nearly the actual time), so it is not the benchmark; the raw archive is. It can be trimmed the same way.
-2. **Run the baseline.** On the VM:
-   `psql "$DATABASE_URL" -c "\copy (SELECT service_date, trip_id, stop_sequence, stop_id, route_id, direction_id, block_id, timepoint, scheduled_at, actual_at, delay_s, gap_s FROM stop_arrivals ORDER BY service_date) TO PROGRAM 'gzip > labels.csv.gz' WITH CSV HEADER"`
-   then copy `labels.csv.gz` to `data/` on the Mac and run `python model/baseline.py data/labels.csv.gz`. Put the results in the README.
-3. **Gradient boosting** (LightGBM): features such as hour, day type, stop position, timepoint, weather, school holidays, previous trip in the same block; predict delay quantiles as well as P(late). Split by date, never randomly. Benchmark against NTA's predictions at the same horizon, read from `data/raw/trip_updates/` (`stop_obs` keeps only the last one). Watch the Irish school mid-term break (late October) in any test period.
-4. Later: deadline routing (OpenTripPlanner or r5py), then the LangGraph agent.
+2. **Gradient boosting** (LightGBM): features such as hour, day type, stop position, timepoint, weather, school holidays, previous trip in the same block; predict delay quantiles as well as P(late). Split by date, never randomly. Benchmark against NTA's predictions at the same horizon, read from `data/raw/trip_updates/` (`stop_obs` keeps only the last one). Watch the Irish school mid-term break (late October) in any test period.
+3. Later: deadline routing (OpenTripPlanner or r5py), then the LangGraph agent.
