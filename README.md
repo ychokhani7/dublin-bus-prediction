@@ -1,62 +1,88 @@
 # Dublin Bus Delay Predictor
 
-Predicts the chance that a Dublin bus or tram gets you somewhere **on time**, and picks the route most likely to arrive before your deadline rather than just the fastest one on paper. It is built on a live pipeline that has collected the National Transport Authority (NTA) realtime feeds every minute since October 2026.
+Predicts the chance that a Dublin bus or tram gets you somewhere **on time**, and picks the route most likely to arrive before your deadline rather than just the fastest one on paper. It is built on a live pipeline that has collected the National Transport Authority (NTA) realtime feeds every minute since 3 October 2026, and turns raw GPS into actual stop arrival times every night.
 
-> **Status:** data collection is live (Dublin Bus, Go-Ahead Ireland, LUAS). Arrival-time labels, models and routing are in progress. See [Roadmap](#roadmap).
+> **Status:** collection and nightly arrival labels are live (Dublin Bus, Go-Ahead Ireland, LUAS). Baseline model, gradient boosting, routing and the agent are next. See [Roadmap](#roadmap).
+>
+> For a file-by-file explanation of how the code works, read **[docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md)**.
 
 ## Architecture
 
 ```
-NTA GTFS-Realtime API  ──every 60 s──>  collector.py (Docker, Azure VM)
-  TripUpdates + Vehicles                  │
-                                          ├─> data/raw/<feed>/<day>/*.pb.gz   full national feed, as received (source of truth)
-                                          └─> PostgreSQL + PostGIS (Azure)    Dublin operators only
-                                                ├─ vehicle_obs   GPS fixes (ground truth)
-                                                ├─ trip_obs      trips, incl. cancellations
-                                                └─ stop_obs      NTA's delay predictions
+NTA GTFS-Realtime API ──every 60 s──> collector.py (Docker, Azure VM, runs 24/7)
+  TripUpdates + Vehicles                │
+                                        ├─> data/raw/<feed>/<day>/*.pb.gz   full national feed, as received (source of truth)
+                                        └─> PostgreSQL + PostGIS (Azure)    Dublin operators only
+                                              ├─ vehicle_obs   GPS fixes (ground truth)
+                                              ├─ trip_obs      trips, incl. cancellations
+                                              └─ stop_obs      NTA's own delay predictions
 
-NTA static GTFS zip  ──every 6 h──>  data/static/*.zip (one file per timetable version)
-                                          └─ load_static.py ─> routes, trips, stop_times, stops, shapes, calendar
-                                                               (versioned; geometry in EPSG:2157, metres)
+NTA static GTFS zip ──every 6 h──> data/static/*.zip (kept only when the file changes)
+
+nightly.sh (cron, 07:00 UTC)
+  1. load_static.py     new zip really changes the timetable? load it as a new version : record as duplicate, delete
+  2. stop_positions.py  where each stop sits along each route shape (metres)          -> shape_stops
+  3. build_arrivals.py  when each vehicle actually passed each stop, and its delay    -> stop_arrivals (training labels)
+  4. load_static.py --prune   keep only the newest 2 timetable versions
 ```
 
 ## Design decisions
 
-**GPS positions are the ground truth, not NTA's predictions.** TripUpdates contain *predicted* delays, and NTA sends only a few stops per trip (median 3, with 31% of trips carrying a single stop update). Vehicle positions record where each bus actually was, so actual arrival times are derived by projecting GPS fixes onto the route shape and interpolating when the bus passed each stop. A naive "GPS ping within 50 m of a stop" approach was rejected: at 60 s polling a bus covers 300 to 500 m between pings, so it misses most stops and over-samples the ones where the bus was stuck, biasing labels toward delay.
+**GPS positions are the ground truth, not NTA's predictions.** TripUpdates contain *predicted* delays, and NTA sends only a few stops per trip (median 3; 31% of trips carry a single stop update, with the delay carried forward). Vehicle positions record where each bus actually was, so actual arrival times are derived from GPS. A naive "GPS ping within 50 m of a stop" approach was rejected: at 60 s polling a bus covers 300 to 500 m between pings, so it misses most stops and over-samples the ones where the bus was stuck, biasing labels towards delay.
 
-**Raw first.** Every response is written to disk, gzipped, before any parsing. Database tables are a rebuildable view: if the labelling logic improves or a new field is needed, the archive is re-parsed rather than recollected.
+**Linear referencing with dynamic programming.** Stops and GPS fixes are both converted to "metres along the route shape". Placing each point at its nearest spot on the line fails on loop routes (9% of Dublin shapes), and placing them one by one lets one mistake drag every later point. Both stages instead choose all positions together with a Viterbi-style search that keeps them in order and close to the line, the same idea map-matching software uses. Arrival time at a stop is interpolated between the two GPS fixes either side of it.
 
-**Versioned timetables.** Realtime `trip_id`s only make sense against the timetable that was live at the time, and NTA publishes new versions every month or two. Each archived zip is loaded as its own snapshot (`static_versions`), never merged into the previous one.
+**Missing rather than invented.** First stops (terminus waiting) are skipped, stop passages are not interpolated across GPS gaps over 5 minutes, and only GPS fixes from 30 minutes before to 90 minutes after a trip's schedule are used (NTA sometimes tags a bus with a trip ID hours before the trip runs).
 
-**Store only the operators we model.** The NTA feed is national (Bus Éireann, Irish Rail and others too). The database keeps Dublin Bus, Go-Ahead Ireland and LUAS to stay within a 32 GB budget; the raw archive keeps everything, so widening scope later costs a re-parse, not lost history.
+**Raw first.** Every response is written to disk, gzipped, before any parsing. Database tables are a rebuildable view of the archive.
 
-**Infrastructure on free tiers.** Azure for Students: a B2ats v2 VM (collector + raw archive) and a managed PostgreSQL Flexible Server B1ms with PostGIS. Alternatives considered: Supabase free (500 MB cap, filled in about a week), Render free (ephemeral disk, needs keep-alive pings), Oracle Always Free (viable fallback when the Azure credit ends).
+**Versioned timetables, loaded only when they change.** NTA republishes the whole timetable every day with a new `feed_version` and a moving date window, and sometimes relabels `service_id`s without changing any trip. Loading each copy would add about 1.8 GB a day. `load_static.py` fingerprints the in-scope part of each new zip (trips compared by stops, times and **actual dates of operation**, not ID labels) and loads it only when something real changed. Changes touching fewer than 1% of trips (and no routes, stops or shapes) are skipped until they add up. After each night's labels are built, only the newest two versions are kept: each label row carries the trip details the model needs (route, direction, block, timepoint), and zips of real changes stay on disk, so an old day can still be rebuilt by reloading its zip. Timetable storage is bounded at two versions (about 1.8 GB each) however long collection runs; pruned names are remembered so their zips are not reloaded.
+
+**Store only the operators we model.** The feed is national. The database keeps Dublin Bus, Go-Ahead Ireland and LUAS to stay inside 32 GB; the raw archive keeps everything.
+
+**Infrastructure on free tiers.** Azure for Students: a B2ats v2 VM (collector, raw archive, nightly job) and a managed PostgreSQL Flexible Server B1ms with PostGIS, both in India South Central (the student subscription restricts regions). The only real cost is the VM's static public IP, about $3.60 a month from the student credit. Alternatives considered: Supabase free (500 MB cap, filled in about a week), Render free (ephemeral disk, needs keep-alive pings), Oracle Always Free (fallback when the credit ends).
 
 ## What the data looks like
 
-Measured from live feeds on 3 October 2026:
-
-| | |
+| Live feeds, 3 October 2026 | |
 |---|---|
-| Realtime trips per snapshot (national) | ~2,700, of which ~1,500 are Dublin Bus, Go-Ahead or LUAS |
+| Realtime trips per snapshot (national) | ~2,700, of which ~1,500 in scope |
 | Vehicles per snapshot (national) | ~1,050, of which ~675 in scope |
 | Cancelled trips in a snapshot | ~2.4% |
 | Realtime `trip_id`s found in the static timetable | 99.8% |
 | Median GPS fix age | 25 s (p90 82 s) |
-| Feed size per poll (uncompressed) | ~680 KB TripUpdates, ~90 KB Vehicles |
 | Timetable loaded (in-scope operators) | 182 routes, 87,421 trips, 4.26 M stop times, 1,559 shapes |
+
+| Labels, Sunday 4 October 2026 | |
+|---|---|
+| Trips with GPS / with arrivals | 6,614 / 6,554 |
+| Arrivals built | 308,744 (93% of scheduled stops on tracked trips) |
+| Stop placement on route shapes | median 6 m from line, max 46 m, 0 out of order |
+| GPS gap around each stop passage | median 69 s, p90 122 s |
+| Delay | p10 -65 s, median +122 s, p90 +552 s; 24.8% more than 5 min late |
+| Agreement with NTA's last prediction for the same stop | median difference 41 s, 59% within 60 s |
+| Likely label noise (>10 min early or >60 min late) | ~0.15%, to be dropped at training time |
+
+| Storage (first weekend) | |
+|---|---|
+| Raw archive on VM disk | ~170 MB/day, ~11 months on the free disk |
+| Database growth (excluding timetable) | ~70 MB/day |
 
 ## Repository layout
 
 | File | Purpose |
 |---|---|
-| `collector.py` | Polls both realtime feeds every minute, archives raw data, writes in-scope rows to Postgres, archives new timetable versions |
-| `load_static.py` | Loads one timetable zip into PostGIS as a versioned snapshot |
-| `schema.sql` | All tables |
-| `check_feeds.py` | One-off profile of the live feeds and timetable (fields present, match rates, sizes) |
-| `migrate_supabase.sql` | Imports the earlier Supabase vehicle-position export |
-| `test_collector.py`, `test_load_static.py` | Tests for parsing and loading |
+| `collector.py` | Polls both realtime feeds every minute, archives raw data, writes in-scope rows to Postgres, archives the timetable zip when it changes |
+| `load_static.py` | Loads a timetable zip into PostGIS as a versioned snapshot; nightly mode loads only zips that change something |
+| `static_diff.py` | Fingerprints and compares two timetable zips; also a command: `python static_diff.py OLD.zip NEW.zip` |
+| `stop_positions.py` | Places every stop along its route shape (table `shape_stops`) |
+| `build_arrivals.py` | Builds one day's actual stop arrival times and delays (table `stop_arrivals`) |
+| `nightly.sh` | Runs the three nightly steps in order, pings a healthcheck if all succeed |
+| `schema.sql` | All tables created up front (`shape_stops` and `stop_arrivals` are created by their scripts) |
+| `migrate_supabase.sql` | Imports the earlier Supabase vehicle-position export (not used yet) |
+| `test_*.py` | Tests for parsing, loading, timetable comparison and stop placement |
 | `docker-compose.yml`, `Dockerfile`, `db/Dockerfile` | Collector image; local Postgres + PostGIS for development |
+| `docs/HOW_IT_WORKS.md` | End-to-end explanation of every file and algorithm |
 
 ## Quick start (local)
 
@@ -69,7 +95,7 @@ docker compose exec collector python load_static.py       # after the first time
 docker compose logs -f collector
 ```
 
-Until `load_static.py` has run, the collector writes only the raw archive (it does not know which routes are in scope yet).
+Until the timetable is loaded, the collector writes only the raw archive (it does not know which routes are in scope yet).
 
 ## Deploying with a managed database
 
@@ -77,13 +103,15 @@ Until `load_static.py` has run, the collector writes only the raw archive (it do
 # .env on the server
 NTA_API_KEY=...
 DATABASE_URL=postgresql://USER:PASSWORD@HOST:5432/bus?sslmode=require
-HEALTHCHECK_URL=https://hc-ping.com/...        # optional, emails you if polling stops
+HEALTHCHECK_URL=https://hc-ping.com/...          # optional: email if polling stops
+NIGHTLY_HEALTHCHECK_URL=https://hc-ping.com/...  # optional: email if a nightly run fails
 
 set -a; . ./.env; set +a
 psql "$DATABASE_URL" -f schema.sql                                   # PostGIS must be allow-listed on Azure (azure.extensions)
 docker compose build collector
 docker compose run --rm --no-deps collector python load_static.py   # load the timetable first
 docker compose up -d --no-deps collector                            # --no-deps: skip the local Postgres container
+crontab -e   # add: 0 7 * * * /home/azureuser/dublin-bus/nightly.sh >> /home/azureuser/dublin-bus/nightly.log 2>&1
 ```
 
 ## Operations
@@ -91,26 +119,36 @@ docker compose up -d --no-deps collector                            # --no-deps:
 | Task | Command |
 |---|---|
 | Collector logs | `docker compose logs -f --since 10m collector` |
-| Running containers | `docker compose ps` |
-| Rows collected | `psql "$DATABASE_URL" -c "SELECT count(*) FROM vehicle_obs"` |
-| Raw archive size | `du -sh data/raw/*` |
-| Database size | `psql "$DATABASE_URL" -c "SELECT pg_size_pretty(pg_database_size('bus'))"` |
-| Load a new timetable version | `docker compose run --rm --no-deps collector python load_static.py` |
-| Profile the live feeds | `docker compose run --rm --no-deps collector python check_feeds.py` |
-| Run tests | `python test_collector.py` and `DATABASE_URL=... python test_load_static.py` |
-
-Monitoring: the collector pings `HEALTHCHECK_URL` after each successful poll; a missed ping for about 10 minutes triggers an email.
+| Nightly job log | `tail -40 nightly.log` |
+| Run the nightly job by hand | `./nightly.sh` |
+| Rebuild one day's labels | `docker compose run --rm --no-deps collector python build_arrivals.py 2026-10-04` |
+| Labels per day | `psql "$DATABASE_URL" -c "SELECT service_date, count(*) FROM stop_arrivals GROUP BY 1 ORDER BY 1"` |
+| Prune old timetable versions | `docker compose run --rm --no-deps collector python load_static.py --prune` |
+| Timetable versions / skipped duplicates | `psql "$DATABASE_URL" -c "SELECT * FROM static_versions" -c "SELECT * FROM static_skipped"` |
+| Compare two timetable zips | `docker compose run --rm --no-deps collector python static_diff.py /data/static/A.zip /data/static/B.zip` |
+| What the database is doing | `psql "$DATABASE_URL" -c "SELECT pid, state, now()-query_start, left(query,60) FROM pg_stat_activity WHERE datname='bus' AND state<>'idle'"` |
+| Raw archive / database size | `du -sh data/raw/*` and `psql "$DATABASE_URL" -c "SELECT pg_size_pretty(pg_database_size('bus'))"` |
+| Run tests | `python test_collector.py`, `python test_stop_positions.py`, `python test_static_diff.py`, `DATABASE_URL=... python test_load_static.py` |
 
 Rate limits: polling both feeds once a minute is about 2,900 requests a day. Run only one collector per API key, or NTA returns `429 Too Many Requests`.
 
+## Lessons learned
+
+- **Bulk loads need `ANALYZE`.** After loading 3.8 M rows, a query that normally takes 14 s ran for 16+ minutes because Postgres still planned for an empty table. `load_static.py` now refreshes statistics after every load.
+- **Not every change deserves a version.** One day's real change was 2 new trips, yet stored a full 1.8 GB copy, so small trip-only changes are now batched until they pass 1%.
+- **Store what the labels need, not every timetable.** Full timetable copies were 1.7 GB of a 2.7 GB database after a week. Copying four trip fields into each label made old versions disposable.
+- **NTA timetable IDs are not stable.** A whole day's copy differed from the previous one only in relabelled `service_id`s on 43,140 trips, with zero changed stop times. Comparing dates of operation instead of labels fixed false "changes".
+- **Feed trip tags can be wrong for hours.** Without a schedule window, a few trips showed arrivals four hours early.
+
 ## Roadmap
 
-- [x] Realtime collection with raw archive, versioned timetable, monitoring
-- [ ] Arrival-time labels: project GPS fixes onto route shapes (PostGIS linear referencing), interpolate stop passage times, nightly job
-- [ ] Storage lifecycle: compact old raw data, move older GPS rows out of the database
-- [ ] Baseline: historical delay distribution by route, stop, hour and weekday
-- [ ] Gradient boosting with weather and previous-trip-in-block delay; predict delay quantiles, not just a threshold
-- [ ] Deadline routing: choose the itinerary with the highest probability of arriving on time (OpenTripPlanner or r5py for candidates)
+- [x] Realtime collection with raw archive, monitoring
+- [x] Versioned timetable, loaded only when it really changes
+- [x] Arrival-time labels: stop placement and GPS tracking along route shapes, nightly job
+- [ ] Baseline: historical delay distribution by route, stop, hour and day type (from ~17 October)
+- [ ] Gradient boosting with weather, school holidays and previous-trip-in-block delay; delay quantiles, not just a threshold; benchmark against NTA's own predictions
+- [ ] Storage lifecycle: compact old raw data, move old GPS rows out of the database
+- [ ] Deadline routing: the itinerary with the highest probability of arriving on time (OpenTripPlanner or r5py for candidates)
 - [ ] LangGraph agent with planner and predictor as tools ("get me to Trinity by 9")
 - [ ] Optional: retrieval over NTA service disruption notices
 

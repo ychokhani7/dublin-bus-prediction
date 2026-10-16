@@ -1,8 +1,9 @@
-"""Loads a tiny fake GTFS zip twice into the database at DATABASE_URL and checks the result.
+"""Loads a tiny fake GTFS zip twice, then runs the nightly load/prune cycle, against the database at DATABASE_URL.
 Run against your local docker db: DATABASE_URL=postgresql://bus:bus@localhost:5432/bus python test_load_static.py"""
 import io
 import os
 import tempfile
+from pathlib import Path
 import zipfile
 
 import psycopg
@@ -45,4 +46,29 @@ if __name__ == "__main__":
         length = q("SELECT ST_Length(geom) FROM shapes s JOIN static_versions v ON v.id = s.version_id WHERE v.name = '20261003_test'")[0][0]
         assert 700 < length < 900, length                  # ~780 m between the two points, in metres thanks to EPSG:2157
         conn.execute("DELETE FROM static_versions WHERE name = '20261003_test'")
+        conn.commit()
+
+        # Nightly cycle: three changed zips load, prune keeps the newest two, and a pruned zip is not reloaded.
+        assert not q("SELECT 1 FROM static_versions"), "needs a database with no timetable versions: prune deletes them"
+        load_static.DATA = Path(tempfile.mkdtemp())
+        (load_static.DATA / "static").mkdir()
+        for day in ("01", "02", "03"):            # each day starts later and adds one trip: a real change
+            files = dict(FILES, **{
+                "feed_info.txt": f"feed_publisher_name,feed_version,feed_start_date,feed_end_date\nNTA,V{day},202610{day},20271001\n",
+                "trips.txt": FILES["trips.txt"] + f"1 39A b a,S1,T{day},UCD,0,B7,SH1\n"})
+            with zipfile.ZipFile(load_static.DATA / "static" / f"202610{day}_cycle.zip", "w") as z:
+                for name, text in files.items():
+                    z.writestr(name, text)
+        names = lambda: sorted(n for (n,) in q("SELECT name FROM static_versions"))
+        load_static.load_new(conn)
+        assert names() == ["20261001_cycle", "20261002_cycle", "20261003_cycle"], names()
+        load_static.prune(conn)
+        load_static.load_new(conn)                 # used to reload 20261001_cycle every night
+        assert names() == ["20261002_cycle", "20261003_cycle"], names()
+        load_static.load(conn, load_static.DATA / "static" / "20261001_cycle.zip")   # old zip reloaded by hand
+        conn.commit()
+        load_static.prune(conn)                    # must drop the old timetable, not the newest one
+        assert names() == ["20261002_cycle", "20261003_cycle"], names()
+        conn.execute("DELETE FROM static_versions WHERE name LIKE '%\\_cycle'")
+        conn.execute("DELETE FROM static_skipped WHERE name LIKE '%\\_cycle'")
     print("ok")

@@ -1,7 +1,11 @@
 """Load one static GTFS zip into PostGIS as a versioned snapshot, keeping only the chosen operators.
 
-Usage: python load_static.py [path/to/gtfs.zip]     (default: newest zip in data/static/)
-Re-running for the same zip replaces that version, so it is safe to repeat.
+Usage: python load_static.py [path/to/gtfs.zip]
+  no argument (the nightly job): check each new zip in data/static/ and load it only if it changes something
+    for our operators. NTA republishes the timetable daily, mostly unchanged; duplicates are recorded in
+    static_skipped and deleted (the Mobility Database keeps every NTA version if they are ever needed).
+  explicit path: (re)load that zip, replacing the version if it exists
+  --prune: keep only the newest KEEP_VERSIONS versions (run after labels are built)
 Streams every file through COPY, so memory stays small even for the nationwide stop_times.txt.
 """
 import csv
@@ -118,15 +122,89 @@ def load(conn, zip_path):
                     cp.write_row((vid, r["service_id"], r["date"], r["exception_type"]))
 
     for table in ["routes", "trips", "stop_times", "stops", "shapes", "calendar", "calendar_dates"]:
+        # Refresh planner statistics now: a bulk load leaves them stale, and Postgres then picks very slow
+        # plans for the next queries on this version (e.g. stop_positions.py) until autovacuum catches up.
+        cur.execute(f"ANALYZE {table}")
         n = cur.execute(f"SELECT count(*) FROM {table} WHERE version_id = %s", (vid,)).fetchone()[0]
         print(f"{table:15} {n:>10,}")
     size = cur.execute("SELECT pg_size_pretty(pg_database_size(current_database()))").fetchone()[0]
     print(f"version {name} loaded as id {vid}; database size now {size}")
 
 
+SKIPPED_SCHEMA = """
+CREATE TABLE IF NOT EXISTS static_skipped (
+  name       text PRIMARY KEY,                                         -- zip stem that was checked and not loaded
+  same_as    smallint REFERENCES static_versions ON DELETE SET NULL,   -- version it duplicated
+  checked_at timestamptz NOT NULL DEFAULT now()
+);
+ALTER TABLE static_skipped ADD COLUMN IF NOT EXISTS reason text"""
+
+
+# Newest timetable, not newest load: an old zip reloaded by hand gets the highest id.
+NEWEST_FIRST = "feed_start_date DESC NULLS LAST, id DESC"
+
+
+def load_new(conn):
+    """Check every zip in data/static/ not seen before, oldest first. Load it only if it changes something
+    for our operators compared with the newest timetable loaded; otherwise record it and delete the file."""
+    from static_diff import compare, fingerprint, is_minor   # imported here: static_diff imports this module
+    conn.execute(SKIPPED_SCHEMA)
+    conn.commit()
+    seen = {n for (n,) in conn.execute("SELECT name FROM static_versions UNION SELECT name FROM static_skipped")}
+    pending = [p for p in sorted((DATA / "static").glob("*.zip")) if p.stem not in seen]
+    if not pending:
+        print("no new timetable to check")
+    base_name, base_fp = None, None
+    for path in pending:
+        latest = conn.execute(f"SELECT id, name FROM static_versions ORDER BY {NEWEST_FIRST} LIMIT 1").fetchone()
+        base_path = DATA / "static" / f"{latest[1]}.zip" if latest else None
+        if not latest or not base_path.exists():
+            print(f"{path.stem}: nothing to compare with, loading")
+            load(conn, path)
+            conn.commit()
+            continue
+        if base_name != latest[1]:
+            with zipfile.ZipFile(base_path) as z:
+                base_fp, base_name = fingerprint(z), latest[1]
+        with zipfile.ZipFile(path) as z:
+            new_fp = fingerprint(z)
+        changes = compare(base_fp, new_fp)
+        summary = "; ".join(f"{len(v)} {label}" for label, v in changes.items() if v)
+        if summary and not is_minor(changes, len(new_fp["trips"])):
+            print(f"{path.stem}: changed vs {latest[1]} ({summary}), loading")
+            load(conn, path)
+            conn.commit()
+        else:
+            reason = f"minor: {summary}" if summary else "duplicate"
+            conn.execute("INSERT INTO static_skipped (name, same_as, reason) VALUES (%s, %s, %s)",
+                         (path.stem, latest[0], reason))
+            conn.commit()
+            path.unlink()
+            print(f"{path.stem}: {reason} vs {latest[1]}, recorded as skipped and deleted")
+
+
+KEEP_VERSIONS = 2
+
+
+def prune(conn):
+    """Delete all but the newest KEEP_VERSIONS timetable versions (~1.8 GB each). Labels already carry the trip
+    details they need, and changed zips stay in data/static/, so an old day can be rebuilt by reloading its zip."""
+    old = [v for (v,) in conn.execute(f"SELECT id FROM static_versions ORDER BY {NEWEST_FIRST} OFFSET %s",
+                                      (KEEP_VERSIONS,))]
+    if old:
+        # remember the names, or load_new would see their zips as new and reload them the next night
+        conn.execute("""INSERT INTO static_skipped (name, reason) SELECT name, 'pruned' FROM static_versions
+                        WHERE id = ANY(%s) ON CONFLICT DO NOTHING""", (old,))
+        conn.execute("DELETE FROM static_versions WHERE id = ANY(%s)", (old,))   # cascades to all static tables
+        conn.commit()
+    print(f"pruned timetable versions {old}" if old else "no timetable versions to prune")
+
+
 if __name__ == "__main__":
-    path = sys.argv[1] if len(sys.argv) > 1 else max((DATA / "static").glob("*.zip"), default=None)
-    if not path:
-        sys.exit("No zip given and none in data/static/ yet (the collector downloads one on start).")
-    with psycopg.connect(os.environ["DATABASE_URL"]) as conn:  # one transaction: all or nothing
-        load(conn, path)
+    with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+        if sys.argv[1:] == ["--prune"]:
+            prune(conn)                        # nightly job, after yesterday's labels are built
+        elif len(sys.argv) > 1:
+            load(conn, Path(sys.argv[1]))      # explicit path: (re)load it regardless
+        else:
+            load_new(conn)                     # nightly job: only what really changed

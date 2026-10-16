@@ -108,3 +108,11 @@ CREATE TABLE calendar_dates (
   service_id text, date date, exception_type smallint,   -- 1 = service added, 2 = removed
   PRIMARY KEY (version_id, service_id, date)
 );
+
+-- Daily NTA timetable zips that changed nothing for our operators (checked by load_static.py, then deleted).
+CREATE TABLE static_skipped (
+  name       text PRIMARY KEY,
+  same_as    smallint REFERENCES static_versions ON DELETE SET NULL,
+  checked_at timestamptz NOT NULL DEFAULT now(),
+  reason     text      -- 'duplicate', or 'minor: ...' for a small trip-only change not worth a new version
+);
