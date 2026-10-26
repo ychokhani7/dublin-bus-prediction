@@ -2,7 +2,7 @@
 
 Predicts the chance that a Dublin bus or tram gets you somewhere **on time**, and picks the route most likely to arrive before your deadline rather than just the fastest one on paper. It is built on a live pipeline that has collected the National Transport Authority (NTA) realtime feeds every minute since 3 October 2026, and turns raw GPS into actual stop arrival times every night.
 
-> **Status:** collection and nightly arrival labels are live (Dublin Bus, Go-Ahead Ireland, LUAS). The baseline model is done (see [What the data looks like](#what-the-data-looks-like)); gradient boosting, routing and the agent are next. See [Roadmap](#roadmap).
+> **Status:** collection and nightly arrival labels are live (Dublin Bus, Go-Ahead Ireland, LUAS). The baseline and a first LightGBM model are done (see [What the data looks like](#what-the-data-looks-like)); live features, routing and the agent are next. See [Roadmap](#roadmap).
 >
 > For a file-by-file explanation of how the code works, read **[docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md)**.
 
@@ -68,14 +68,19 @@ nightly.sh (cron, 07:00 UTC)
 | Raw archive on VM disk | ~170 MB/day, ~11 months on the free disk |
 | Database growth (excluding timetable) | ~70 MB/day |
 
-| Baseline, `model/baseline.py` (train 4-12 Oct, test 13-15 Oct, target: more than 5 min late) | Brier | Skill | Log loss | AUC |
+| Baseline, `model/baseline.py` (train 4-18 Oct, test 19-25 Oct, target: more than 5 min late) | Brier | Skill | Log loss | AUC |
 |---|---|---|---|---|
-| Overall late rate (22-24%) | 0.174 | 0% | 0.532 | 0.50 |
-| + route, day type | 0.171 | 1.6% | 0.524 | 0.59 |
-| + direction, hour | 0.164 | 5.9% | 0.502 | 0.68 |
-| + stop | **0.157** | **9.5%** | **0.485** | **0.72** |
+| Overall late rate (23.6% train, 24.1% test) | 0.183 | 0% | 0.553 | 0.50 |
+| + route, day type | 0.179 | 2.2% | 0.541 | 0.60 |
+| + direction, hour | 0.172 | 6.2% | 0.524 | 0.67 |
+| + stop | 0.164 | 10.5% | 0.504 | 0.72 |
+| LightGBM, `model/gbm.py` (train 4-15 Oct, early stopping on 16-18 Oct, refit on 4-18 Oct) | **0.155** | **15.2%** | **0.475** | **0.75** |
 
-Brier is the mean squared error of the predicted probability (lower is better), skill is the Brier improvement over always predicting the overall rate, and AUC is the chance a late arrival gets a higher score than an on-time one (0.5 = guessing). History alone explains about a tenth of the uncertainty. Calibration is good up to about 30% but too high above it (predicted 57% late, actual 49% in the 0.5-0.7 bin): the test days were less late than the training days (22.4% vs 23.9%), and nine days of history overfit the busiest stop-hours. This is the number gradient boosting must beat.
+Brier is the mean squared error of the predicted probability (lower is better), skill is the Brier improvement over always predicting the overall rate, and AUC is the chance a late arrival gets a higher score than an on-time one (0.5 = guessing). History alone explains about a tenth of the uncertainty. Its calibration is off at both ends: stop-hours it rates almost never late (2.5% predicted) were late 6.7% of the time, and the riskiest ones (78% predicted) only 64%.
+
+LightGBM adds timetable position, the bus's day (trip number in its block, scheduled layover after the previous trip), minute of day and hourly weather (Open-Meteo, cached in `data/weather.csv` and refreshed when the labels run past it), all known before the bus leaves. On a full test week it beats the baseline clearly (skill 10.5% to 15.2%, AUC 0.72 to 0.75) and is well calibrated: within about 1 point up to 30% predicted and at most 3 points high above it (44.7% predicted, 42.0% actual in the 0.4-0.5 bin). It predicts 25.0% late against 24.1% actual. What it cannot explain is day-to-day variation: the late share in the test week ran from 15% (Monday 19 October) to 31% (Thursday and Friday), and skill per day from 3% (Saturday 24) to 21% (Thursday 22). Sunday 25 October had road closures (probably the Dublin Marathon; only 249k arrivals labelled against 386k the Saturday before) and was 29% late; dropping it raises skill by about half a point and changes no ranking. Its delay quantiles beat a constant (pinball loss p90 63 s vs 77 s, 88.8% of delays below the predicted p90), with the median a little high (53.6% below p50). The most useful features are route, minute of day, stop, layover, stop sequence and minutes into the trip.
+
+Model choice (26 October, same features and split, Brier skill): LightGBM with learning rate 0.03 and 255 leaves 15.2% (2 min to train, now the default in `gbm.py`), the earlier settings (learning rate 0.1, 127 leaves) 14.6%, the average of baseline and LightGBM 14.6%, CatBoost (depth 8) 11.7% and 8x slower. The slower LightGBM won on 6 of 7 test days and tied the seventh, so the small gap is real. Three validation days (Friday to Sunday) beat two (a weekend only): two weekend days stopped training after 73 trees, too early for weekday traffic. Next: the mid-term break (26-30 October) as a school-holiday feature, then live features (the bus's current delay) with a fixed prediction horizon.
 
 ## Repository layout
 
@@ -89,7 +94,9 @@ Brier is the mean squared error of the predicted probability (lower is better), 
 | `nightly.sh` | Runs the three nightly steps in order, pings a healthcheck if all succeed |
 | `schema.sql` | All tables created up front (`shape_stops` and `stop_arrivals` are created by their scripts) |
 | `migrate_supabase.sql` | Imports the earlier Supabase vehicle-position export (not used yet) |
-| `test_*.py` | Tests for parsing, loading, timetable comparison and stop placement |
+| `model/baseline.py` | Baseline P(late): historical late rate by route, direction, stop, hour and day type |
+| `model/gbm.py` | LightGBM P(late) and delay quantiles from timetable, block, calendar and weather features |
+| `test_*.py`, `model/test_*.py` | Tests for parsing, loading, timetable comparison, stop placement, baseline and features |
 | `docker-compose.yml`, `Dockerfile`, `db/Dockerfile` | Collector image; local Postgres + PostGIS for development |
 | `docs/HOW_IT_WORKS.md` | End-to-end explanation of every file and algorithm |
 
@@ -154,8 +161,9 @@ Rate limits: polling both feeds once a minute is about 2,900 requests a day. Run
 - [x] Realtime collection with raw archive, monitoring
 - [x] Versioned timetable, loaded only when it really changes
 - [x] Arrival-time labels: stop placement and GPS tracking along route shapes, nightly job
-- [x] Baseline: historical late rate by route, direction, stop, hour and day type, shrunk towards coarser groups (Brier skill 9.5%, AUC 0.72)
-- [ ] Gradient boosting with weather, school holidays and previous-trip-in-block delay; delay quantiles, not just a threshold; benchmark against NTA's own predictions
+- [x] Baseline: historical late rate by route, direction, stop, hour and day type, shrunk towards coarser groups (Brier skill 10.5%, AUC 0.72 on 19-25 Oct)
+- [x] Gradient boosting v1 (LightGBM): timetable, block, calendar and weather features; P(late) and delay quantiles (Brier skill 15.2%, AUC 0.75 on 19-25 Oct)
+- [ ] Gradient boosting v2: live features (current delay, previous trip in the block) at a fixed horizon, school holidays; benchmark against NTA's predictions at the same horizon
 - [ ] Storage lifecycle: compact old raw data, move old GPS rows out of the database
 - [ ] Deadline routing: the itinerary with the highest probability of arriving on time (OpenTripPlanner or r5py for candidates)
 - [ ] LangGraph agent with planner and predictor as tools ("get me to Trinity by 9")
