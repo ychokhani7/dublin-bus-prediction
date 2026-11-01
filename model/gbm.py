@@ -92,8 +92,9 @@ def pinball(y, p, q):
     return np.mean(np.maximum(q * d, (q - 1) * d))
 
 
-def main():
-    path = Path(sys.argv[1])
+def train_predict(path):
+    """Train on every non-test day and predict the test days. Returns (test frame with columns p_base, p_late, p10,
+    p50, p90; the train + valid days; the P(late) model; its number of trees). Used by main() and benchmark_nta.py."""
     df = load(path)
     days = sorted(df.service_date.unique())
     test_days, valid_days = days[-TEST_DAYS:], days[-TEST_DAYS - VALID_DAYS:-TEST_DAYS]
@@ -106,17 +107,24 @@ def main():
     for c in CATEGORIES:                                          # one category list for train and test alike
         df[c] = df[c].astype("category")
     is_test, is_valid = df.service_date.isin(test_days), df.service_date.isin(valid_days)
-    train, valid, test = df[~is_test & ~is_valid], df[is_valid], df[is_test]
+    train, valid, test = df[~is_test & ~is_valid], df[is_valid], df[is_test].copy()
     fmt = lambda ds: f"{pd.Timestamp(ds[0]):%d %b}-{pd.Timestamp(ds[-1]):%d %b}"
     print(f"train {fmt(days[:-TEST_DAYS - VALID_DAYS])} ({len(train):,}), valid {fmt(valid_days)} ({len(valid):,}), "
           f"test {fmt(test_days)} ({len(test):,})")
 
     model, trees = fit("binary", train, valid, "late")
-    p = model.predict(test[FEATURES])
-    y = test.late.values
-    rate_brier = np.mean((pd.concat([train, valid]).late.mean() - y) ** 2)   # always predicting the overall rate
+    test["p_base"], test["p_late"] = p_base, model.predict(test[FEATURES])
+    for q in QUANTILES:
+        test[f"p{round(q * 100)}"] = fit("quantile", train, valid, "delay_s", alpha=q)[0].predict(test[FEATURES])
+    return test, pd.concat([train, valid]), model, trees
+
+
+def main():
+    test, history, model, trees = train_predict(Path(sys.argv[1]))
+    p, y = test.p_late.values, test.late.values
+    rate_brier = np.mean((history.late.mean() - y) ** 2)          # always predicting the overall rate
     print(f"\nP(late), {trees} trees     {'Brier':>7} {'skill':>7} {'log loss':>9} {'AUC':>6}")
-    for name, pr in [("baseline (history by stop)", p_base), ("gradient boosting", p)]:
+    for name, pr in [("baseline (history by stop)", test.p_base.values), ("gradient boosting", p)]:
         brier, logloss, area = scores(y, pr)
         print(f"{name:26} {brier:7.4f} {1 - brier / rate_brier:7.1%} {logloss:9.4f} {area:6.3f}")
 
@@ -128,9 +136,8 @@ def main():
 
     print(f"\ndelay quantiles     {'pinball s':>9} {'vs constant':>11} {'actual below':>12}")
     for q in QUANTILES:
-        m, _ = fit("quantile", train, valid, "delay_s", alpha=q)
-        pq = m.predict(test[FEATURES])
-        const = np.quantile(pd.concat([train, valid]).delay_s, q)
+        pq = test[f"p{round(q * 100)}"].values
+        const = np.quantile(history.delay_s, q)
         print(f"p{round(q * 100):<18} {pinball(test.delay_s.values, pq, q):9.1f} "
               f"{pinball(test.delay_s.values, const, q):11.1f} {np.mean(test.delay_s.values < pq):12.1%}")
 

@@ -82,6 +82,22 @@ LightGBM adds timetable position, the bus's day (trip number in its block, sched
 
 Model choice (26 October, same features and split, Brier skill): LightGBM with learning rate 0.03 and 255 leaves 15.2% (2 min to train, now the default in `gbm.py`), the earlier settings (learning rate 0.1, 127 leaves) 14.6%, the average of baseline and LightGBM 14.6%, CatBoost (depth 8) 11.7% and 8x slower. The slower LightGBM won on 6 of 7 test days and tied the seventh, so the small gap is real. Three validation days (Friday to Sunday) beat two (a weekend only): two weekend days stopped training after 73 trees, too early for weekday traffic. Next: the mid-term break (26-30 October) as a school-holiday feature, then live features (the bus's current delay) with a fixed prediction horizon.
 
+### Benchmark against NTA's predictions
+
+`model/benchmark_nta.py` asks whether our model is close to or behind NTA's own realtime predictions. For each test arrival it reads what NTA's TripUpdates feed predicted 5, 15, 30 and 60 minutes before the scheduled time, from the raw per-minute archive (the database's `stop_obs` keeps only NTA's last prediction, seconds before arrival, so it can't be the benchmark). It reports per horizon NTA's coverage, AUC for late arrivals, precision at equal recall and mean absolute delay error, split by trips already running and not yet started. Our model uses no live data, so its predictions are the same at every horizon. Method in `docs/HOW_IT_WORKS.md` section 7b.
+
+Results pending the first real run. To run it on the Mac, copy the test week's raw TripUpdates from the VM (one day either side, for the first prediction of the day and trips running past midnight; folders are UTC days), then:
+
+```bash
+for d in 18 19 20 21 22 23 24 25 26; do rsync -a <vm>:dublin-bus/data/raw/trip_updates/2026-10-$d data/raw/trip_updates/; done
+```
+
+```bash
+python model/benchmark_nta.py data/labels.csv.gz data/raw/trip_updates
+```
+
+Optional `first_day last_day` arguments (YYYY-MM-DD) narrow the test days, within `gbm.py`'s test week.
+
 ## Repository layout
 
 | File | Purpose |
@@ -96,6 +112,7 @@ Model choice (26 October, same features and split, Brier skill): LightGBM with l
 | `migrate_supabase.sql` | Imports the earlier Supabase vehicle-position export (not used yet) |
 | `model/baseline.py` | Baseline P(late): historical late rate by route, direction, stop, hour and day type |
 | `model/gbm.py` | LightGBM P(late) and delay quantiles from timetable, block, calendar and weather features |
+| `model/benchmark_nta.py` | Our model against NTA's realtime predictions at 5, 15, 30 and 60 minutes ahead, from the raw archive |
 | `test_*.py`, `model/test_*.py` | Tests for parsing, loading, timetable comparison, stop placement, baseline and features |
 | `docker-compose.yml`, `Dockerfile`, `db/Dockerfile` | Collector image; local Postgres + PostGIS for development |
 | `docs/HOW_IT_WORKS.md` | End-to-end explanation of every file and algorithm |
@@ -144,7 +161,7 @@ crontab -e   # add: 0 7 * * * /home/azureuser/dublin-bus/nightly.sh >> /home/azu
 | Compare two timetable zips | `docker compose run --rm --no-deps collector python static_diff.py /data/static/A.zip /data/static/B.zip` |
 | What the database is doing | `psql "$DATABASE_URL" -c "SELECT pid, state, now()-query_start, left(query,60) FROM pg_stat_activity WHERE datname='bus' AND state<>'idle'"` |
 | Raw archive / database size | `du -sh data/raw/*` and `psql "$DATABASE_URL" -c "SELECT pg_size_pretty(pg_database_size('bus'))"` |
-| Run tests | `python test_collector.py`, `python test_stop_positions.py`, `python test_static_diff.py`, `DATABASE_URL=... python test_load_static.py` |
+| Run tests | `python test_collector.py`, `python test_stop_positions.py`, `python test_static_diff.py`, `DATABASE_URL=... python test_load_static.py`, `python model/test_baseline.py`, `python model/test_gbm.py`, `python model/test_benchmark_nta.py` |
 
 Rate limits: polling both feeds once a minute is about 2,900 requests a day. Run only one collector per API key, or NTA returns `429 Too Many Requests`.
 
@@ -163,7 +180,7 @@ Rate limits: polling both feeds once a minute is about 2,900 requests a day. Run
 - [x] Arrival-time labels: stop placement and GPS tracking along route shapes, nightly job
 - [x] Baseline: historical late rate by route, direction, stop, hour and day type, shrunk towards coarser groups (Brier skill 10.5%, AUC 0.72 on 19-25 Oct)
 - [x] Gradient boosting v1 (LightGBM): timetable, block, calendar and weather features; P(late) and delay quantiles (Brier skill 15.2%, AUC 0.75 on 19-25 Oct)
-- [ ] Gradient boosting v2: live features (current delay, previous trip in the block) at a fixed horizon, school holidays; benchmark against NTA's predictions at the same horizon
+- [ ] Gradient boosting v2: live features (current delay, previous trip in the block) at a fixed horizon, school holidays; benchmark against NTA's predictions at the same horizon (code in `model/benchmark_nta.py`, first real run pending)
 - [ ] Storage lifecycle: compact old raw data, move old GPS rows out of the database
 - [ ] Deadline routing: the itinerary with the highest probability of arriving on time (OpenTripPlanner or r5py for candidates)
 - [ ] LangGraph agent with planner and predictor as tools ("get me to Trinity by 9")

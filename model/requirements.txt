@@ -1,3 +1,4 @@
 pandas>=2.2
 numpy>=1.26
 lightgbm>=4.5   # macOS also needs: brew install libomp
+gtfs-realtime-bindings>=1.0   # model/benchmark_nta.py reads the raw TripUpdates archive
