@@ -65,7 +65,10 @@ def add_weather(df, cache):
     """Hourly Dublin weather from Open-Meteo, cached next to the labels. Observed values: in production these
     would be the forecast for that hour."""
     if not cache.exists() or pd.read_csv(cache).time.max() < df.sched.max().strftime("%Y-%m-%dT%H:00"):
-        pd.DataFrame(json.load(urlopen(WEATHER_URL))["hourly"]).to_csv(cache, index=False)
+        new = pd.DataFrame(json.load(urlopen(WEATHER_URL))["hourly"])
+        if cache.exists():    # the API only goes back 92 days: keep older hours, newer values win
+            new = pd.concat([pd.read_csv(cache), new]).drop_duplicates("time", keep="last").sort_values("time")
+        new.to_csv(cache, index=False)
     w = pd.read_csv(cache)
     w["hour"] = pd.to_datetime(w.time).dt.tz_localize("UTC")
     df["hour"] = df.sched.dt.floor("h")
